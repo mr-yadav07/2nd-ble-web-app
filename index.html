@@ -1,0 +1,246 @@
+<script>
+// BLE UUIDs
+const SERVICE    = '12345678-1234-1234-1234-1234567890ab';
+const COLOR_UUID = '87654321-4321-4321-4321-abcdefabcdef';
+const LED_UUID   = 'abcdefab-cdef-cdef-cdef-1234567890ab';
+
+// Internal device state
+let devices = [];        // {device, server, colorChar, ledChar, selected, active, lastColor:[r,g,b], online}
+let activeDevice = null; // device currently being edited
+
+// UI refs
+const deviceListDiv = document.getElementById('deviceList');
+const statusDiv = document.getElementById('status');
+const btnScan = document.getElementById('btnScan');
+const btnSync = document.getElementById('btnSync');
+const redSlider = document.getElementById('redSlider');
+const greenSlider = document.getElementById('greenSlider');
+const blueSlider = document.getElementById('blueSlider');
+const btnLedOn = document.getElementById('btnLedOn');
+const btnLedOff = document.getElementById('btnLedOff');
+
+// Logging
+function log(msg){
+  const t = new Date().toLocaleTimeString();
+  statusDiv.textContent += `[${t}] ${msg}\n`;
+  statusDiv.scrollTop = statusDiv.scrollHeight;
+}
+
+// Utility
+function findEntry(devId){
+  return devices.find(d => d.device.id === devId);
+}
+
+// Render list
+function renderList(){
+  deviceListDiv.innerHTML = '';
+  devices.forEach(entry => {
+    const row = document.createElement('div');
+    row.className = 'deviceRow' + (entry.active ? ' active' : '');
+
+    const info = document.createElement('div');
+    info.className = 'devInfo';
+    info.innerHTML =
+      `<strong>${entry.device.name || entry.device.id}</strong>
+       <div style="font-size:12px;color:#555">
+       ${entry.online ? 'online' : 'offline'} |
+       last R=${entry.lastColor[0]} G=${entry.lastColor[1]} B=${entry.lastColor[2]}
+       </div>`;
+
+    const controls = document.createElement('div');
+
+    const chk = document.createElement('input');
+    chk.type = 'checkbox';
+    chk.checked = entry.selected;
+    chk.onclick = () => { entry.selected = chk.checked; };
+
+    const edit = document.createElement('button');
+    edit.textContent = 'Edit';
+    edit.onclick = () => activateDevice(entry);
+
+    const conn = document.createElement('button');
+    conn.textContent = entry.online ? 'Disconnect' : 'Connect';
+    conn.onclick = () =>
+      entry.online ? disconnect(entry) : connect(entry);
+
+    controls.appendChild(chk);
+    controls.appendChild(edit);
+    controls.appendChild(conn);
+
+    row.appendChild(info);
+    row.appendChild(controls);
+    deviceListDiv.appendChild(row);
+  });
+}
+
+// Scan
+async function scan(){
+  try {
+    const dev = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: [SERVICE]
+    });
+    if (findEntry(dev.id)) {
+      log("Device already exists.");
+      return;
+    }
+    const entry = {
+      device: dev,
+      server: null,
+      colorChar: null,
+      ledChar: null,
+      lastColor: [0,0,0],
+      selected: false,
+      active: false,
+      online: false,
+      ignoreNotifications: false
+    };
+    devices.push(entry);
+    renderList();
+    connect(entry);
+  } catch (err) {
+    log("Scan error: " + err);
+  }
+}
+
+// Connect
+async function connect(entry){
+  try {
+    log("Connecting " + entry.device.name);
+    entry.server = await entry.device.gatt.connect();
+
+    entry.device.addEventListener('gattserverdisconnected', () => {
+      entry.online = false;
+      log(entry.device.name + " disconnected");
+      renderList();
+      setTimeout(() => connect(entry), 1500);
+    });
+
+    const svc = await entry.server.getPrimaryService(SERVICE);
+    entry.colorChar = await svc.getCharacteristic(COLOR_UUID);
+    entry.ledChar   = await svc.getCharacteristic(LED_UUID);
+
+    // Subscribe (but controlled)
+    await entry.colorChar.startNotifications();
+    entry.colorChar.addEventListener('characteristicvaluechanged', ev => {
+      if (entry.ignoreNotifications) return;
+      const v = ev.target.value;
+      if (v.byteLength >= 3) {
+        entry.lastColor = [
+          v.getUint8(0),
+          v.getUint8(1),
+          v.getUint8(2)
+        ];
+        if (entry === activeDevice) syncSliders(entry);
+        renderList();
+      }
+    });
+
+    // Initial read (only once)
+    try {
+      const v = await entry.colorChar.readValue();
+      if (v.byteLength >= 3)
+        entry.lastColor = [
+          v.getUint8(0),
+          v.getUint8(1),
+          v.getUint8(2)
+        ];
+    } catch (_) {}
+
+    entry.online = true;
+    renderList();
+    log("Connected " + entry.device.name);
+
+  } catch (err) {
+    entry.online = false;
+    log("Connect error: " + err);
+    renderList();
+  }
+}
+
+// Disconnect
+function disconnect(entry){
+  try {
+    entry.device.gatt.disconnect();
+  } catch (_) {}
+}
+
+// Activate a device for slider editing
+function activateDevice(entry){
+  devices.forEach(d => d.active = false);
+  entry.active = true;
+  activeDevice = entry;
+
+  // Only now read + sync sliders from device
+  syncSliders(entry);
+
+  renderList();
+  log("Editing " + entry.device.name);
+}
+
+// Sync UI sliders from device lastColor
+function syncSliders(entry){
+  entry.ignoreNotifications = true;
+  redSlider.value   = entry.lastColor[0];
+  greenSlider.value = entry.lastColor[1];
+  blueSlider.value  = entry.lastColor[2];
+  setTimeout(() => entry.ignoreNotifications = false, 120);
+}
+
+// Write RGB to *all selected* devices
+async function broadcastRGB(){
+  const r = Number(redSlider.value)|0;
+  const g = Number(greenSlider.value)|0;
+  const b = Number(blueSlider.value)|0;
+
+  const frame = new Uint8Array([r,g,b]);
+
+  const targets = devices.filter(d => d.selected && d.online && d.colorChar);
+  if (targets.length === 0) return;
+
+  for (const d of targets){
+    try {
+      await d.colorChar.writeValue(frame);
+      d.lastColor = [r,g,b];
+    } catch (err){
+      log("Write fail " + d.device.name + ": " + err);
+    }
+  }
+  renderList();
+}
+
+// LED write
+async function setLedState(state){
+  const targets = devices.filter(d => d.selected && d.online && d.ledChar);
+  const frame = new Uint8Array([state ? 1 : 0]);
+  for (const d of targets){
+    try {
+      await d.ledChar.writeValue(frame);
+    } catch (err){
+      log("LED fail " + d.device.name);
+    }
+  }
+}
+
+// Slider event – update all selected simultaneously
+let sendTimer = null;
+function sliderChanged(){
+  if (sendTimer) clearTimeout(sendTimer);
+  sendTimer = setTimeout(() => {
+    broadcastRGB();
+  }, 45); // Smooth and fast
+}
+
+// Attach events
+btnScan.onclick = scan;
+btnSync.onclick = broadcastRGB;
+btnLedOn.onclick = () => setLedState(true);
+btnLedOff.onclick = () => setLedState(false);
+
+redSlider.oninput   = sliderChanged;
+greenSlider.oninput = sliderChanged;
+blueSlider.oninput  = sliderChanged;
+
+renderList();
+log("App ready");
+</script>
